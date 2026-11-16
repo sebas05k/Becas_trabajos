@@ -1,0 +1,36 @@
+name: Alerta semanal Radar Agronómico
+
+on:
+  schedule:
+    - cron: "0 12 * * 1"      # lunes 12:00 UTC = 7:00 a. m. en Colombia
+  workflow_dispatch:          # permite ejecutarlo a mano para probar
+
+permissions:
+  contents: write             # para guardar data/historial.json (detecta "nuevas")
+
+jobs:
+  alerta:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Generar y enviar el Top semanal
+        run: python alerta_semanal.py
+        env:
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          ALERT_TO: ${{ secrets.ALERT_TO }}
+          RELIEFWEB_APPNAME: ${{ secrets.RELIEFWEB_APPNAME }}
+          JOOBLE_API_KEY: ${{ secrets.JOOBLE_API_KEY }}
+          LINEAS: ${{ vars.LINEAS }}
+      - name: Guardar historial y CSV
+        run: |
+          git config user.name "radar-bot"
+          git config user.email "radar-bot@users.noreply.github.com"
+          git add data/
+          git diff --cached --quiet || git commit -m "Actualiza historial del radar"
+          git push

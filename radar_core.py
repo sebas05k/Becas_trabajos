@@ -10,23 +10,26 @@ No depende de Streamlit: lo usan app.py (interfaz) y alerta_semanal.py (correo).
 """
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
 import re
 import smtplib
 import ssl
+import time
 import unicodedata
 import xml.etree.ElementTree as ET
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.utils import parsedate_to_datetime
 from html import escape
+from io import BytesIO
 from typing import Optional
-from urllib.parse import parse_qsl, quote_plus, urlencode, urljoin, urlparse
+from urllib.parse import parse_qs, parse_qsl, quote_plus, unquote, urlencode, urljoin, urlparse
 
 import pandas as pd
 import requests
@@ -108,7 +111,9 @@ def _url_canonica(u: str) -> str:
 def _es_institucional(url: str) -> bool:
     host = urlparse(url or "").netloc.lower().split(":")[0]
     partes = set(host.split("."))
-    return bool(partes & {"edu", "gov", "gob", "int", "ac", "mil"})
+    if partes & {"edu", "gov", "gob", "int", "ac", "mil"}:
+        return True
+    return bool(re.search(r"\.go\.(jp|kr|th|id|ke|tz|ug)$|(^|\.)(ufv|ufla|usp|unesp|unicamp|ufrgs|ufpr|ufsc|ufrrj|embrapa)\.br$", host))
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -461,6 +466,7 @@ _PAISES_RX = [(n, r, re.compile(x)) for n, r, x in _PAISES_DEF]
 REGION_DE = {n: r for n, r, _ in _PAISES_DEF}
 REGION_DE.update({"Global": "Global", "Remoto / Internacional": "Remoto", "Europa (varios)": "Europa",
                   "Asia (varios)": "Asia", "Latinoamérica": "Latinoamérica"})
+PAISES = sorted(REGION_DE)
 REGIONES = ["Colombia", "Latinoamérica", "Norteamérica", "Europa", "Asia", "África", "Oceanía", "Remoto", "Global"]
 _RE_REMOTO = re.compile(r"\b(remote|remoto|teletrabajo|home office|work from home|trabajo remoto|100% remot\w*)\b")
 
@@ -573,13 +579,16 @@ class Oportunidad:
 
 
 CONF_FUENTE = {"Directorio oficial": "Alta", "ReliefWeb": "Alta", "Scholars4Dev": "Media",
-               "Computrabajo": "Media", "Jooble": "Media", "Prensa (Google News)": "Baja"}
+               "Computrabajo": "Media", "Jooble": "Media", "Prensa y noticias": "Baja",
+               "Web (DuckDuckGo)": "Baja", "Web (Serper)": "Baja"}
 NOTA_FUENTE = {
     "ReliefWeb": "Publicado por la organización empleadora vía ReliefWeb (ONU/ONG).",
     "Scholars4Dev": "Agregador reconocido de becas; confirma requisitos y fechas en el sitio oficial.",
     "Computrabajo": "Portal de empleo; confirma la empresa y la vigencia antes de postular.",
     "Jooble": "Metabuscador de empleo; confirma en la página original.",
-    "Prensa (Google News)": "Detectada en prensa/blogs: úsala como pista y confirma en la fuente oficial.",
+    "Prensa y noticias": "Detectada en prensa/blogs: úsala como pista y confirma en la fuente oficial.",
+    "Web (DuckDuckGo)": "Resultado de búsqueda web: confirma que sea la página oficial de la convocatoria.",
+    "Web (Serper)": "Resultado de búsqueda web: confirma que sea la página oficial de la convocatoria.",
     "Directorio oficial": "Portal institucional oficial. Revisa la convocatoria vigente; las fechas cambian cada año.",
 }
 
@@ -639,78 +648,220 @@ _RE_TIPO = {
 }
 
 
-def _consultas_gnews(prof: str, lineas: list[str]) -> list[tuple]:
+def _anio_objetivo(hoy: Optional[date] = None) -> int:
+    """Año de las convocatorias que se están abriendo (desde agosto se miran las del año siguiente)."""
+    hoy = hoy or hoy_co()
+    return hoy.year + 1 if hoy.month >= 8 else hoy.year
+
+
+def _consultas(prof: str, lineas: list[str], hoy: date) -> list[dict]:
+    """Consultas de búsqueda. web=True las usa DuckDuckGo/Serper; news=True las usan Google News y Bing News."""
+    A = _anio_objetivo(hoy)
     ES, EN, PT = ("es-419", "CO", "CO:es-419"), ("en", "US", "US:en"), ("pt-419", "BR", "BR:pt-419")
-    Q: list[tuple] = []
+    Q: list[dict] = []
 
-    def q(tipo, texto, loc, prio=1):
-        Q.append((tipo, texto, loc[0], loc[1], loc[2], prio))
+    def q(tipo, texto, loc, prio=1, web=True, news=True):
+        Q.append({"tipo": tipo, "q": texto, "hl": loc[0], "gl": loc[1], "ceid": loc[2],
+                  "prio": prio, "web": web, "news": news})
 
-    # Estudios — base
+    # ── Maestrías en Colombia
+    q("estudio", f"maestría ciencias agrarias OR agronomía inscripciones abiertas {A} Colombia", ES)
+    q("estudio", f"maestría fitopatología OR fitomejoramiento OR suelos admisiones {A} Colombia", ES)
+    q("estudio", f"beca maestría agricultura Colombia Minciencias OR ICETEX {A}", ES)
     q("estudio", "convocatoria beca maestría agronomía", ES)
-    q("estudio", "convocatoria beca doctorado ciencias agrarias", ES)
-    q("estudio", "becas posgrado ingeniería agronómica Colombia", ES)
-    q("estudio", "fully funded PhD plant science OR plant pathology OR plant breeding", EN)
-    q("estudio", "MSc agronomy OR agriculture scholarship international students", EN)
-    q("estudio", "edital mestrado OR doutorado agronomia fitotecnia", PT)
-    q("estudio", "scholarship agriculture Korea OR Japan OR China international students", EN, 2)
-    q("estudio", "agricultural sciences PhD scholarship Europe fully funded", EN, 2)
+    # ── Brasil
+    q("estudio", f"edital seleção mestrado agronomia {A} inscrições", PT)
+    q("estudio", f"edital mestrado fitotecnia OR fitopatologia OR melhoramento genético {A} estrangeiros", PT)
+    q("estudio", f"mestrado ciência do solo OR entomologia agrícola edital {A} candidatos estrangeiros", PT, 2)
+    q("estudio", "bolsa CAPES mestrado agronomia estudantes estrangeiros Colômbia", PT, 2)
+    q("estudio", f"maestría en Brasil agronomía estudiantes extranjeros beca {A}", ES, 2)
+    # ── Japón
+    q("estudio", f"MEXT scholarship master agriculture Colombia {A}", EN)
+    q("estudio", f"Japan graduate school agriculture master's international students scholarship {A}", EN)
+    q("estudio", f"beca MEXT maestría Japón Colombia convocatoria {A}", ES, 2)
+    # ── China
+    q("estudio", f"Chinese Government Scholarship master agriculture international students {A}", EN)
+    q("estudio", f"China Agricultural University OR Nanjing Agricultural University master scholarship {A}", EN, 2)
+    q("estudio", f"beca gobierno chino maestría agricultura Colombia convocatoria {A}", ES, 2)
+    # ── Corea, Europa, EE. UU.
+    q("estudio", f"GKS Korea master scholarship agriculture {A}", EN, 2)
+    q("estudio", f"fully funded MSc agriculture OR agronomy OR plant science scholarship international students {A}", EN)
+    q("estudio", f"Erasmus Mundus master plant OR agriculture OR soil scholarship {A}", EN, 2)
+    q("estudio", f"MS assistantship plant pathology OR plant breeding {A} international", EN, 2)
     q("estudio", "curso capacitación agricultura becas internacional convocatoria", ES, 2)
-    q("estudio", "short course agriculture scholarship applications open", EN, 2)
-    q("estudio", "convocatoria beca agricultura México OR Chile OR Argentina OR Perú posgrado", ES, 2)
-    # Trabajo — base
+    # ── Trabajo en Colombia
     q("trabajo", "vacante ingeniero agrónomo Colombia", ES)
     q("trabajo", "oferta empleo agrónomo asistencia técnica Colombia", ES)
     q("trabajo", "convocatoria Agrosavia OR Cenicaña OR Cenicafé OR Cenipalma vacantes", ES)
-    q("trabajo", "agronomist OR plant breeder job Colombia OR Ecuador OR Peru", EN, 2)
-    q("trabajo", "convocatoria investigador agrícola OR fitomejoramiento empleo", ES, 2)
-    # Fondos — base
+    q("trabajo", f"convocatoria profesional agropecuario ADR OR ICA OR SENA OR alcaldía {A}", ES, 2)
+    q("trabajo", "contratación prestación de servicios ingeniero agrónomo SECOP", ES, 2)
+    q("trabajo", "vacante ingeniero agrónomo Antioquia OR Valle OR Cundinamarca OR Meta OR Tolima OR Santander", ES, 2)
+    q("trabajo", "convocatoria investigador agrícola OR fitomejoramiento empleo Colombia", ES, 2)
+    q("trabajo", "site:linkedin.com/jobs ingeniero agrónomo Colombia", ES, 1, True, False)
+    q("trabajo", "site:co.computrabajo.com ingeniero agrónomo", ES, 1, True, False)
+    q("trabajo", "site:elempleo.com ingeniero agrónomo", ES, 2, True, False)
+    q("trabajo", "site:serviciodeempleo.gov.co ingeniero agrónomo", ES, 2, True, False)
+    # ── Fondos
     q("fondo", "convocatoria Minciencias proyectos agropecuarios", ES)
     q("fondo", "convocatoria Finagro OR ADR OR Fontagro proyectos agropecuarios", ES)
     q("fondo", "agricultural research grant call for proposals Latin America", EN, 2)
     q("fondo", "convocatoria fondo innovación agropecuaria financiación", ES, 2)
-    # Por línea de investigación elegida
+    # ── Por línea de investigación elegida
     for nombre in lineas:
         L = LINEAS.get(nombre)
         if not L:
             continue
-        q("estudio", f"convocatoria beca doctorado OR maestría {L['es']}", ES)
-        q("estudio", f"fully funded PhD OR scholarship {L['en']}", EN)
-        q("estudio", f"edital mestrado OR doutorado {L['pt']}", PT, 2)
+        q("estudio", f"convocatoria beca maestría {L['es']} {A}", ES)
+        q("estudio", f"fully funded MSc OR master scholarship {L['en']} {A}", EN)
+        q("estudio", f"edital mestrado {L['pt']} {A}", PT, 2)
         q("trabajo", f"vacante OR empleo {L['es']} Colombia", ES)
-        q("trabajo", f"{L['en']} job Latin America", EN, 2)
         q("fondo", f"convocatoria proyectos financiación {L['es']}", ES, 2)
-    return Q if prof == "profunda" else [x for x in Q if x[5] == 1]
+    return Q if prof == "profunda" else [x for x in Q if x["prio"] == 1]
 
 
-def recolectar_gnews(hoy: date, prof: str, lineas: list[str]) -> list[Oportunidad]:
-    consultas = _consultas_gnews(prof, lineas)
+def _gnews_decodificar(url: str) -> str:
+    """Los enlaces de Google News esconden la URL real; en el formato antiguo se puede decodificar."""
+    try:
+        if "news.google.com/rss/articles/" not in url:
+            return url
+        token = url.split("/articles/")[1].split("?")[0]
+        crudo = base64.urlsafe_b64decode(token + "=" * (-len(token) % 4))
+        m = re.search(rb"https?://[\x21-\x7e]+", crudo)
+        return m.group(0).decode("ascii", "ignore") if m else url
+    except Exception:
+        return url
+
+
+def _real_url_bing(link: str) -> str:
+    try:
+        return parse_qs(urlparse(link).query).get("url", [link])[0]
+    except Exception:
+        return link
+
+
+def _real_url_ddg(href: str) -> str:
+    try:
+        if "uddg=" in href:
+            h = href if href.startswith("http") else "https:" + href
+            return unquote(parse_qs(urlparse(h).query).get("uddg", [href])[0])
+    except Exception:
+        pass
+    return href
+
+
+def recolectar_prensa(hoy: date, prof: str, lineas: list[str]) -> list[Oportunidad]:
+    """Google News + Bing News (RSS, sin clave)."""
+    consultas = [c for c in _consultas(prof, lineas, hoy) if c["news"]]
     dias = 45 if prof == "profunda" else 30
+    limite = hoy - timedelta(days=dias + 15)
 
     def una(c):
-        tipo, texto, hl, gl, ceid, _ = c
-        url = "https://news.google.com/rss/search?" + urlencode(
-            {"q": f"{texto} when:{dias}d", "hl": hl, "gl": gl, "ceid": ceid})
-        try:
-            return tipo, _leer_rss(url)[:30], True
-        except Exception:
-            return tipo, [], False
+        motores = [
+            ("gn", "https://news.google.com/rss/search?" + urlencode(
+                {"q": f"{c['q']} when:{dias}d", "hl": c["hl"], "gl": c["gl"], "ceid": c["ceid"]})),
+            ("bing", "https://www.bing.com/news/search?" + urlencode(
+                {"q": c["q"], "format": "rss", "setlang": c["hl"][:2], "cc": c["gl"]})),
+        ]
+        filas, ok = [], False
+        for motor, u in motores:
+            try:
+                filas += [(motor, it) for it in _leer_rss(u)[:25]]
+                ok = True
+            except Exception:
+                continue
+        return c["tipo"], filas, ok
 
     out, fallidas = [], 0
     with ThreadPoolExecutor(6) as ex:
-        for tipo, items, ok in ex.map(una, consultas):
+        for tipo, filas, ok in ex.map(una, consultas):
             fallidas += 0 if ok else 1
-            for it in items:
+            for motor, it in filas:
                 titulo, medio = it["titulo"], it["fuente"]
                 if medio and titulo.endswith(" - " + medio):
                     titulo = titulo[: -len(medio) - 3]
-                if not _RE_TIPO[tipo].search(norm(titulo)):
+                if it["fecha"] and it["fecha"] < limite:
                     continue
+                if not _RE_TIPO[tipo].search(norm(titulo + " " + it["desc"][:200])):
+                    continue
+                url = _real_url_bing(it["url"]) if motor == "bing" else _gnews_decodificar(it["url"])
+                real = not any(h in url for h in ("news.google.com", "bing.com/news"))
                 out.append(Oportunidad(
-                    tipo=tipo, titulo=titulo, url=it["url"], fuente="Prensa (Google News)", institucion=medio,
-                    resumen=titulo, publicado=it["fecha"]))
+                    tipo=tipo, titulo=titulo, url=url, fuente="Prensa y noticias", institucion=medio,
+                    resumen=(titulo + ". " + it["desc"][:220]) if motor == "bing" else titulo,
+                    publicado=it["fecha"], pendiente_detalle=real))
     if consultas and fallidas == len(consultas):
-        raise RuntimeError("no se pudo consultar Google News (sin conexión o bloqueo temporal)")
+        raise RuntimeError("no se pudo consultar Google/Bing News (sin conexión o bloqueo temporal)")
+    return out
+
+
+def _desde_web(tipo: str, titulo: str, url: str, snippet: str, fuente: str) -> Optional[Oportunidad]:
+    if not titulo or not url.startswith("http"):
+        return None
+    if not _RE_TIPO[tipo].search(norm(titulo + " " + snippet)):
+        return None
+    return Oportunidad(tipo=tipo, titulo=titulo, url=url, fuente=fuente, resumen=snippet[:400],
+                       texto=snippet, pendiente_detalle=True)
+
+
+_KL = {"CO": "co-es", "BR": "br-pt", "US": "us-en"}
+
+
+def recolectar_ddg(hoy: date, prof: str, lineas: list[str]) -> list[Oportunidad]:
+    """Búsqueda web general vía DuckDuckGo (sin clave). Puede bloquearse desde servidores en la nube."""
+    consultas = [c for c in _consultas(prof, lineas, hoy) if c["web"]]
+
+    def una(c):
+        time.sleep(0.5)
+        try:
+            r = SESION.post("https://html.duckduckgo.com/html/", timeout=TIMEOUT,
+                            data={"q": c["q"], "kl": _KL.get(c["gl"], "wt-wt"), "df": "y"})
+            r.raise_for_status()
+            soup = BeautifulSoup(r.text, "html.parser")
+            filas = []
+            for res in soup.select("div.result, div.web-result")[:15]:
+                a = res.select_one("a.result__a")
+                if not a or not a.get("href"):
+                    continue
+                sn = res.select_one(".result__snippet")
+                filas.append((a.get_text(" ", strip=True), _real_url_ddg(a["href"]),
+                              sn.get_text(" ", strip=True) if sn else ""))
+            return c["tipo"], filas
+        except Exception:
+            return c["tipo"], []
+
+    out, total = [], 0
+    with ThreadPoolExecutor(2) as ex:
+        for tipo, filas in ex.map(una, consultas):
+            total += len(filas)
+            for titulo, url, sn in filas:
+                o = _desde_web(tipo, titulo, url, sn, "Web (DuckDuckGo)")
+                if o:
+                    out.append(o)
+    if consultas and total == 0:
+        raise RuntimeError("DuckDuckGo no devolvió resultados (posible bloqueo desde la nube). "
+                           "Alternativa: clave gratuita de Serper (SERPER_API_KEY).")
+    return out
+
+
+def recolectar_serper(clave: Optional[str], hoy: date, prof: str, lineas: list[str]) -> list[Oportunidad]:
+    """Búsqueda web con resultados tipo Google (requiere clave de serper.dev)."""
+    if not clave:
+        raise RuntimeError("omitida: falta SERPER_API_KEY (opcional, serper.dev)")
+    out = []
+    for c in [c for c in _consultas(prof, lineas, hoy) if c["web"]]:
+        try:
+            r = SESION.post("https://google.serper.dev/search", timeout=TIMEOUT,
+                            headers={"X-API-KEY": clave, "Content-Type": "application/json"},
+                            json={"q": c["q"], "gl": c["gl"].lower(), "hl": c["hl"][:2], "num": 20, "tbs": "qdr:y"})
+            r.raise_for_status()
+        except Exception:
+            continue
+        for it in r.json().get("organic", []):
+            o = _desde_web(c["tipo"], it.get("title", ""), it.get("link", ""), it.get("snippet", ""), "Web (Serper)")
+            if o:
+                out.append(o)
+    if not out:
+        raise RuntimeError("Serper no devolvió resultados (revisa la clave o la cuota)")
     return out
 
 
@@ -847,15 +998,33 @@ def _campos_s4d(texto: str) -> dict:
     return out
 
 
-def enriquecer(o: Oportunidad) -> None:
-    r = http_get(o.url)
+def _descargar(url: str):
+    """Devuelve (texto, contenedor_html|None). Lee HTML y PDF (los editales brasileños suelen ser PDF)."""
+    r = SESION.get(url, timeout=TIMEOUT)
+    r.raise_for_status()
+    ctype = (r.headers.get("Content-Type") or "").lower()
+    if "pdf" in ctype or url.lower().split("?")[0].endswith(".pdf"):
+        if len(r.content) > 8_000_000:
+            raise RuntimeError("PDF demasiado grande")
+        try:
+            from pypdf import PdfReader
+        except ImportError:
+            raise RuntimeError("falta instalar pypdf")
+        lector = PdfReader(BytesIO(r.content))
+        texto = " ".join((p.extract_text() or "") for p in lector.pages[:6])
+        return re.sub(r"\s+", " ", texto)[:14000], None
     soup = BeautifulSoup(r.text, "html.parser")
     for t in soup(["script", "style", "nav", "footer", "header", "aside", "form", "noscript"]):
         t.decompose()
     cont = soup.select_one("div.entry, div.post, article, main, #content") or soup.body or soup
-    o.texto = re.sub(r"\s+", " ", cont.get_text(" ", strip=True))[:14000]
+    return re.sub(r"\s+", " ", cont.get_text(" ", strip=True))[:14000], cont
+
+
+def enriquecer(o: Oportunidad) -> None:
+    texto, cont = _descargar(o.url)
+    o.texto = texto
     host = urlparse(o.url).netloc
-    if not o.url_oficial:
+    if cont is not None and not o.url_oficial:
         for a in cont.find_all("a", href=True):
             h = a["href"]
             if (h.startswith("http") and urlparse(h).netloc != host and
@@ -885,6 +1054,68 @@ def _enriquecer_seguro(o: Oportunidad) -> bool:
         return True
     except Exception:
         return False
+
+
+_RE_ENLACE_CONV = re.compile(
+    r"convocator|call for|apply|application|admission|admisi|edital|selecao|processo seletivo|inscri|scholarship|"
+    r"beca|bolsa|postula|prospective|international students|vacante|empleo|trabaje con|work with us|careers|vacanc|recruit")
+
+
+def escanear_oficial(o: Oportunidad, hoy: date, max_sub: int = 3) -> bool:
+    """Entra al portal oficial, sigue los enlaces de convocatoria/edital/admisión y lee fechas (HTML o PDF).
+    Si encuentra un cierre vigente, convierte la entrada del directorio en una convocatoria detectada."""
+    texto, cont = _descargar(o.url)
+    paginas = [(o.url, texto)]
+    if cont is not None:
+        base_host, cand = urlparse(o.url).netloc, []
+        for a in cont.find_all("a", href=True):
+            txt, href = a.get_text(" ", strip=True), urljoin(o.url, a["href"].strip())
+            if not href.startswith("http") or not 4 <= len(txt) <= 140:
+                continue
+            if _RE_ENLACE_CONV.search(norm(txt + " " + href)) and _url_canonica(href) != _url_canonica(o.url):
+                cand.append((0 if urlparse(href).netloc == base_host else 1, href))
+        vistos = []
+        for _, h in sorted(cand):
+            if h not in vistos:
+                vistos.append(h)
+        for h in vistos[:max_sub]:
+            try:
+                paginas.append((h, _descargar(h)[0]))
+            except Exception:
+                continue
+    mejor = None
+    for url_p, t in paginas:
+        i, c = extraer_fechas(t[:12000], hoy)
+        if c and c >= hoy:
+            clave = (2 if i else 1, -(c - hoy).days)
+            if not mejor or clave > mejor[0]:
+                mejor = (clave, url_p, i, c, t)
+    if not mejor:
+        return False
+    _, url_p, i, c, t = mejor
+    o.inicio, o.cierre = i, c
+    if url_p != o.url:
+        o.url_oficial, o.url = o.url, url_p        # la página de la convocatoria pasa a ser el enlace principal
+    o.texto = t[:6000]
+    o.requisitos = extraer_requisitos(t)
+    o.origen = "detectada"                          # ya tiene fecha: entra a las listas y al ranking
+    return True
+
+
+def _escanear_seguro(o: Oportunidad, hoy: date, max_sub: int) -> bool:
+    try:
+        return escanear_oficial(o, hoy, max_sub)
+    except Exception:
+        return False
+
+
+def _paralelo(fn, objetos, workers: int, timeout: int) -> int:
+    """Ejecuta fn sobre cada objeto en paralelo con un tope de tiempo total. Devuelve cuántos dieron True."""
+    ex = ThreadPoolExecutor(workers)
+    futs = [ex.submit(fn, x) for x in objetos]
+    hechos, _ = wait(futs, timeout=timeout)
+    ex.shutdown(wait=False, cancel_futures=True)
+    return sum(1 for f in hechos if not f.exception() and f.result())
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -952,6 +1183,20 @@ def _catalogo() -> list[Oportunidad]:
       "https://www.eacea.ec.europa.eu/scholarships/erasmus-mundus-catalogue_en", "Cada máster fija su propia fecha; muchas cierran entre diciembre y febrero.", FIN_COMPLETA, meses=[12, 1, 2])
     d("estudio", "Programa Eiffel de excelencia (Francia)", "Campus France", "Francia", MD,
       "https://www.campusfrance.org/en/eiffel-scholarship-program-of-excellence", "La candidatura la presenta la universidad francesa; ciclo habitual a inicios de año.", FIN_COMPLETA, meses=[11, 12, 1])
+    d("estudio", "Embrapa — estancias y posgrado asociado (Brasil)", "Embrapa", "Brasil", MD,
+      "https://www.embrapa.br", "Centro de investigación agropecuaria; ofrece estancias y orientadores para posgrado en alianza con universidades.")
+    d("estudio", "UNESP Jaboticabal (FCAV) — posgrado en Agronomía (Brasil)", "UNESP", "Brasil", MD,
+      "https://www.fcav.unesp.br", "Programas en Producción Vegetal, Genética y Mejoramiento, Entomología; editais por programa.")
+    d("estudio", "Universidade Federal do Paraná / UFRGS — posgrados en Agronomía (Brasil)", "UFPR", "Brasil", MD,
+      "https://www.ufpr.br", "Posgrados en ciencias agrarias; revisa cada programa y su edital para extranjeros.")
+    d("estudio", "China Agricultural University — programas de maestría para estudiantes internacionales", "CAU", "China", MD,
+      "https://english.cau.edu.cn", "Programas en inglés y becas CSC/universitarias para internacionales.", FIN_COMPLETA, meses=[1, 2, 3, 4])
+    d("estudio", "Nanjing Agricultural University — programas internacionales", "NJAU", "China", MD,
+      "https://www.njau.edu.cn", "Programas de maestría y becas para estudiantes internacionales.", FIN_COMPLETA, meses=[1, 2, 3, 4])
+    d("estudio", "University of Tsukuba — maestrías en ciencias de la vida y agricultura (Japón)", "University of Tsukuba", "Japón", MD,
+      "https://www.tsukuba.ac.jp/en/", "Programas internacionales; combina con becas MEXT y de la propia universidad.", meses=[4, 5, 10, 11])
+    d("estudio", "Hokkaido University — Graduate School of Agriculture (Japón)", "Hokkaido University", "Japón", MD,
+      "https://www.hokudai.ac.jp/en/", "Programas internacionales en agricultura; contactar al profesor supervisor antes de aplicar.")
     d("estudio", "Wageningen University — másteres y PhD en ciencias agrarias", "Wageningen University & Research", "Países Bajos", MD,
       "https://www.wur.nl", "Referente mundial en agricultura; revisa becas WUR y vacantes de PhD.")
     d("estudio", "Fundación Carolina — becas de posgrado (España)", "Fundación Carolina", "España", MD,
@@ -1090,13 +1335,18 @@ def finalizar(o: Oportunidad, hoy: date) -> Oportunidad:
 
 
 def puntuar(o: Oportunidad, lineas_usuario: Optional[list[str]] = None, hoy: Optional[date] = None,
-            boost_nuevo: bool = False) -> int:
+            boost_nuevo: bool = False, paises_prioridad: Optional[list[str]] = None,
+            niveles_pref: Optional[list[str]] = None) -> int:
     hoy = hoy or hoy_co()
     p = o.relevancia * 0.3
     p += {"Alta": 25, "Media": 15, "Baja": 4}.get(o.confianza, 4)
     if o.tipo == "estudio":
         pesos = {NIV_DOCT: 20, NIV_MAESTRIA: 18, NIV_POSTDOC: 16, NIV_POSGRADO: 12, NIV_CURSO: 8, NIV_PASANTIA: 8}
         p += max((v for k, v in pesos.items() if k in o.nivel), default=3)
+        if paises_prioridad and o.pais in paises_prioridad:
+            p += 10
+        if niveles_pref and any(n in o.nivel for n in niveles_pref):
+            p += 12
     elif o.tipo == "trabajo":
         p += {"Investigación": 16, "Gerencia / Coordinación": 13, "Docencia": 12, "Cooperación / ONG": 12,
               "Asistencia técnica": 11, "Consultoría": 11, "Técnico-comercial": 9, "Pasantía / Junior": 6}.get(o.cargo_tipo, 8)
@@ -1165,11 +1415,19 @@ def marcar_novedades(items: list[Oportunidad], ruta: str) -> bool:
     return primera
 
 
-FUENTES_DEFECTO = ["Scholars4Dev", "Prensa (Google News)", "ReliefWeb", "Computrabajo", "Jooble"]
+FUENTES_DEFECTO = ["Scholars4Dev", "Prensa y noticias", "Web (DuckDuckGo)", "Web (Serper)", "ReliefWeb",
+                   "Computrabajo", "Jooble", "Sitios oficiales"]
+
+# Enfoque por defecto: maestrías (países prioritarios) y empleo realista en Colombia
+ENFOQUE_DEFECTO = {
+    "niveles_estudio": [NIV_MAESTRIA],
+    "regiones_trabajo": ["Colombia"],
+    "paises_prioridad": ["Brasil", "Japón", "China", "Colombia"],
+}
 
 
 def recolectar_todo(cfg: dict) -> tuple[list[Oportunidad], list[dict]]:
-    """cfg: profundidad ('rapida'|'profunda'), fuentes, lineas, reliefweb, jooble."""
+    """cfg: profundidad ('rapida'|'profunda'), fuentes, lineas, reliefweb, jooble, serper."""
     hoy = hoy_co()
     prof = cfg.get("profundidad", "rapida")
     fuentes = set(cfg.get("fuentes", FUENTES_DEFECTO))
@@ -1177,8 +1435,12 @@ def recolectar_todo(cfg: dict) -> tuple[list[Oportunidad], list[dict]]:
     tareas = []
     if "Scholars4Dev" in fuentes:
         tareas.append(("Scholars4Dev", lambda: recolectar_scholars4dev(hoy, 5 if prof == "profunda" else 2)))
-    if "Prensa (Google News)" in fuentes:
-        tareas.append(("Prensa (Google News)", lambda: recolectar_gnews(hoy, prof, lineas)))
+    if "Prensa y noticias" in fuentes:
+        tareas.append(("Prensa y noticias", lambda: recolectar_prensa(hoy, prof, lineas)))
+    if "Web (DuckDuckGo)" in fuentes:
+        tareas.append(("Web (DuckDuckGo)", lambda: recolectar_ddg(hoy, prof, lineas)))
+    if "Web (Serper)" in fuentes:
+        tareas.append(("Web (Serper)", lambda: recolectar_serper(cfg.get("serper"), hoy, prof, lineas)))
     if "ReliefWeb" in fuentes:
         tareas.append(("ReliefWeb", lambda: recolectar_reliefweb(cfg.get("reliefweb"), hoy)))
     if "Computrabajo" in fuentes:
@@ -1191,7 +1453,7 @@ def recolectar_todo(cfg: dict) -> tuple[list[Oportunidad], list[dict]]:
         try:
             return nombre, fn(), None
         except Exception as e:  # una fuente caída no debe tumbar el radar
-            return nombre, [], str(e)[:160]
+            return nombre, [], str(e)[:170]
 
     log, crudos = [], []
     with ThreadPoolExecutor(max(1, len(tareas))) as ex:
@@ -1209,26 +1471,58 @@ def recolectar_todo(cfg: dict) -> tuple[list[Oportunidad], list[dict]]:
             candidatos.append(o)
     candidatos = deduplicar(candidatos)
 
-    # Enriquecer con la página de detalle (fechas, requisitos, enlace oficial)
-    max_enr = 90 if prof == "profunda" else 30
+    # Leer la página (HTML o PDF) de cada resultado: fechas, requisitos, enlace oficial
+    max_enr = 150 if prof == "profunda" else 60
     pend = sorted([o for o in candidatos if o.pendiente_detalle],
                   key=lambda x: x.publicado or date.min, reverse=True)[:max_enr]
-    with ThreadPoolExecutor(8) as ex:
-        ok = list(ex.map(_enriquecer_seguro, pend))
-    log.append({"Fuente": "Páginas de detalle", "Resultados brutos": len(pend),
-                "Estado": f"✅ {sum(ok)} leídas · ⚠️ {len(ok) - sum(ok)} con error" if pend else "—"})
+    ok = _paralelo(_enriquecer_seguro, pend, 8, 150)
+    log.append({"Fuente": "Lectura de páginas de detalle", "Resultados brutos": len(pend),
+                "Estado": f"✅ {ok} leídas de {len(pend)}" if pend else "—"})
 
     final = [finalizar(o, hoy) for o in candidatos]
-    for o in _catalogo():
-        final.append(finalizar(o, hoy))
+
+    # Escaneo de portales oficiales (directorio): busca convocatorias vigentes con fecha
+    catalogo = _catalogo()
+    if "Sitios oficiales" in fuentes:
+        n = _paralelo(lambda o: _escanear_seguro(o, hoy, 5 if prof == "profunda" else 3), catalogo, 10, 170)
+        log.append({"Fuente": "Sitios oficiales (escaneo)", "Resultados brutos": len(catalogo),
+                    "Estado": f"✅ {n} portales con fecha de cierre vigente detectada"})
+    final += [finalizar(o, hoy) for o in catalogo]
     return deduplicar(final), log
 
 
-def calendario_recurrente(items: list[Oportunidad], hoy: Optional[date] = None) -> list[Oportunidad]:
+def calendario_recurrente(items: list[Oportunidad], hoy: Optional[date] = None,
+                          niveles: Optional[list[str]] = None) -> list[Oportunidad]:
     """Programas del directorio que suelen abrir este mes o el siguiente (referencial)."""
     hoy = hoy or hoy_co()
     meses = {hoy.month, hoy.month % 12 + 1}
-    return [o for o in items if o.origen == "directorio" and set(o.meses) & meses]
+    res = [o for o in items if o.origen == "directorio" and set(o.meses) & meses]
+    if niveles:
+        res = [o for o in res if o.tipo != "estudio" or any(n in o.nivel for n in niveles)]
+    return res
+
+
+def filtrar_enfoque(items: list[Oportunidad], niveles=None, regiones_trabajo=None, hoy=None):
+    """Aplica el enfoque (maestrías + empleo en Colombia) y descarta lo cerrado."""
+    hoy = hoy or hoy_co()
+    niveles = niveles or ENFOQUE_DEFECTO["niveles_estudio"]
+    regiones = regiones_trabajo or ENFOQUE_DEFECTO["regiones_trabajo"]
+    vivas = [o for o in items if o.origen == "detectada" and estado(o.inicio, o.cierre, hoy)[0] != "Cerrada"]
+    est = [o for o in vivas if o.tipo == "estudio" and any(n in o.nivel for n in niveles)]
+    trab = [o for o in vivas if o.tipo == "trabajo" and o.region in regiones]
+    fon = [o for o in vivas if o.tipo == "fondo" and o.region in ("Colombia", "Latinoamérica", "Global")]
+    return est, trab, fon
+
+
+def top_por_pais(items: list[Oportunidad], paises: list[str], k: int = 3, hoy=None) -> dict:
+    """Mejores estudios por país: primero las convocatorias detectadas, luego el directorio oficial."""
+    hoy = hoy or hoy_co()
+    out = {}
+    for p in paises:
+        lst = [o for o in items if o.tipo == "estudio" and o.pais == p and estado(o.inicio, o.cierre, hoy)[0] != "Cerrada"]
+        lst.sort(key=lambda o: (o.origen == "directorio", -o.puntaje))
+        out[p] = lst[:k]
+    return out
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -1265,6 +1559,7 @@ def enlaces_directos(es: str, en: str, pt: str) -> dict[str, list[tuple[str, str
     def gl(q):
         return "https://www.google.com/search?q=" + quote_plus(q)
     E, Q, P = quote_plus(en), quote_plus(es), quote_plus(pt)
+    ANIO = _anio_objetivo()
     return {
         "🎓 Estudios": [
             ("FindAPhD (PhD en inglés)", f"https://www.findaphd.com/phds/?Keywords={E}"),
@@ -1274,10 +1569,10 @@ def enlaces_directos(es: str, en: str, pt: str) -> dict[str, list[tuple[str, str
             ("Academic Positions", g("academicpositions.com", en)),
             ("Mastersportal (másteres)", g("mastersportal.com", en)),
             ("DAAD (Alemania)", g("daad.de", en)),
-            ("Brasil · editais de mestrado/doutorado", gl(f"edital seleção mestrado doutorado {pt} 2027")),
+            ("Brasil · editais de mestrado/doutorado", gl(f"edital seleção mestrado doutorado {pt} {ANIO}")),
             ("Brasil · CAPES", g("gov.br/capes", pt)),
-            ("Convocatorias de becas (ES)", gl(f"convocatoria beca posgrado {es} 2027")),
-            ("Asia · becas (Corea/Japón/China)", gl(f"scholarship {en} Korea OR Japan OR China international students 2027")),
+            ("Convocatorias de becas (ES)", gl(f"convocatoria beca posgrado {es} {ANIO}")),
+            ("Asia · becas (Corea/Japón/China)", gl(f"scholarship {en} Korea OR Japan OR China international students {ANIO}")),
         ],
         "💼 Trabajo": [
             ("LinkedIn · Colombia", f"https://www.linkedin.com/jobs/search/?keywords={Q}&location=Colombia"),
@@ -1293,9 +1588,9 @@ def enlaces_directos(es: str, en: str, pt: str) -> dict[str, list[tuple[str, str
         "💰 Fondos": [
             ("Minciencias", g("minciencias.gov.co", f"convocatoria {es}")),
             ("FONTAGRO", g("fontagro.org", f"convocatoria {es}")),
-            ("Finagro / ADR", gl(f"convocatoria Finagro OR ADR {es} 2027")),
-            ("Convocatorias de fondos agrarios (ES)", gl(f"convocatoria fondo proyectos {es} Colombia 2027")),
-            ("Grants (EN)", gl(f"call for proposals grant {en} Latin America 2027")),
+            ("Finagro / ADR", gl(f"convocatoria Finagro OR ADR {es} {ANIO}")),
+            ("Convocatorias de fondos agrarios (ES)", gl(f"convocatoria fondo proyectos {es} Colombia {ANIO}")),
+            ("Grants (EN)", gl(f"call for proposals grant {en} Latin America {ANIO}")),
         ],
     }
 
@@ -1303,7 +1598,7 @@ def enlaces_directos(es: str, en: str, pt: str) -> dict[str, list[tuple[str, str
 def _tarjeta_html(o: Oportunidad, hoy: date) -> str:
     et, dc, _ = estado(o.inicio, o.cierre, hoy)
     cierre = (f"Cierra: {fmt_fecha(o.cierre)}" + (f" ({dc} d)" if dc is not None and dc >= 0 else "")) \
-        if o.cierre else "Cierre: ver convocatoria"
+        if o.cierre else (f"Publicada: {fmt_fecha(o.publicado)}" if o.tipo == "trabajo" and o.publicado else "Cierre: ver convocatoria")
     abre = f" · Abre: {fmt_fecha(o.inicio)}" if o.inicio else ""
     conf = {"Alta": "✅ Verificada", "Media": "🟡 Fuente reconocida", "Baja": "🔎 Por verificar"}[o.confianza]
     meta = " · ".join(x for x in [o.institucion, o.pais if o.pais != "No especificado" else "",

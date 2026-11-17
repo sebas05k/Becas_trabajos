@@ -6,6 +6,11 @@ from html import escape
 
 import pandas as pd
 import streamlit as st
+import prospeccion
+
+tab_trabajo, tab_estudios, tab_prosp = st.tabs(["💼 Trabajo", "🎓 Estudios", "🎯 Prospección"])
+with tab_prosp:
+    prospeccion.render()
 
 import radar_core as rc
 

@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
 """Radar Agronómico Global — interfaz Streamlit.  Ejecutar:  streamlit run app.py"""
 import os
+import re
 from html import escape
 
+import pandas as pd
 import streamlit as st
 
 import radar_core as rc
@@ -44,6 +46,7 @@ CLS_CONF = {"Alta": "b-ok", "Media": "b-warn", "Baja": "b-bad"}
 TXT_CONF = {"Alta": "✅ Verificada", "Media": "🟡 Fuente reconocida", "Baja": "🔎 Por verificar"}
 CLS_ESTADO = {"Abierta": "b-ok", "Cierra pronto": "b-warn", "Próxima apertura": "b-info",
               "Cerrada": "b-bad", "Sin fecha confirmada": "b-info"}
+NIVELES_OPC = [rc.NIV_MAESTRIA, rc.NIV_DOCT, rc.NIV_POSTDOC, rc.NIV_CURSO, rc.NIV_POSGRADO, rc.NIV_PASANTIA]
 
 
 def tabla(df, **cfg):
@@ -54,9 +57,9 @@ def tabla(df, **cfg):
 
 
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
-def cargar_radar(profundidad, fuentes, lineas, reliefweb, jooble):
+def cargar_radar(profundidad, fuentes, lineas, reliefweb, jooble, serper):
     cfg = {"profundidad": profundidad, "fuentes": list(fuentes), "lineas": list(lineas),
-           "reliefweb": reliefweb, "jooble": jooble}
+           "reliefweb": reliefweb, "jooble": jooble, "serper": serper}
     items, log = rc.recolectar_todo(cfg)
     primera = rc.marcar_novedades(items, HIST)
     return items, log, primera
@@ -72,21 +75,25 @@ solo_lineas = sb.checkbox("Mostrar solo lo que coincide con mis líneas", value=
                           disabled=not (lineas_sel or extra))
 profundidad = sb.radio("Profundidad de búsqueda", ["rapida", "profunda"], horizontal=True,
                        format_func=lambda x: "⚡ Rápida" if x == "rapida" else "🔬 Profunda",
-                       help="Profunda: más consultas, más países y más páginas de detalle (tarda más).")
+                       help="Profunda: más consultas, más páginas leídas y más portales oficiales escaneados (tarda más).")
 fuentes = sb.multiselect("Fuentes activas", rc.FUENTES_DEFECTO, default=rc.FUENTES_DEFECTO,
-                         help="ReliefWeb y Jooble requieren una clave gratuita (ver pestaña Alertas).")
+                         help="ReliefWeb, Jooble y Serper requieren una clave gratuita (ver pestaña Alertas).")
 
 sb.markdown("---")
-sb.subheader("🎓 Filtros de estudios")
-regiones_est = sb.multiselect("Destino", rc.REGIONES, default=[r for r in rc.REGIONES if r != "Remoto"])
+sb.subheader("🎓 Estudios")
+niveles_sel = sb.multiselect("Nivel", NIVELES_OPC, default=[rc.NIV_MAESTRIA])
+incluir_sin_nivel = sb.checkbox("Incluir las de nivel no identificado", value=True)
+paises_prio = sb.multiselect("Países prioritarios", rc.PAISES,
+                             default=[p for p in rc.ENFOQUE_DEFECTO["paises_prioridad"] if p in rc.PAISES],
+                             help="Suben en el ranking y tienen su propia sección en el Top.")
+solo_paises = sb.checkbox("Mostrar solo estos países", value=False)
 solo_elegibles = sb.checkbox("Ocultar las que excluyen a Colombia", value=True)
 solo_financiadas = sb.checkbox("Solo con financiación / estipendio", value=False)
 
-sb.subheader("💼 Filtros de trabajo")
-regiones_trab = sb.multiselect(
-    "Dónde trabajar", rc.REGIONES, default=["Colombia", "Latinoamérica", "Remoto", "Global"],
-    help="Latinoamérica: Ecuador, Perú y Bolivia (Comunidad Andina), Mercosur y otros países suelen tener "
-         "trámites más sencillos para colombianos. Verifica siempre los requisitos migratorios.")
+sb.subheader("💼 Trabajo")
+regiones_trab = sb.multiselect("Dónde trabajar", rc.REGIONES, default=rc.ENFOQUE_DEFECTO["regiones_trabajo"],
+                               help="Por defecto solo Colombia. Agrega Latinoamérica o Remoto si quieres ampliar.")
+ciudad = sb.text_input("Ciudad o departamento (opcional)", placeholder="p. ej. Palmira, Meta, Antioquia")
 cargos_sel = sb.multiselect("Tipo de cargo", rc.CARGOS)
 
 sb.markdown("---")
@@ -103,45 +110,51 @@ if sb.button("🔄 Actualizar ahora (limpiar caché)"):
 
 # ───────────────────────── carga ─────────────────────────
 st.title("🌾 Radar Global de Oportunidades — Ingeniería Agronómica")
-st.caption("Becas, empleo y fondos estrictamente agrarios · Colombia, Latinoamérica, EE. UU., Europa y Asia · "
-           "Las fechas se detectan automáticamente: confírmalas siempre en la convocatoria oficial.")
+st.caption("Maestrías, empleo en Colombia y fondos agrarios · Brasil, Japón, China, Colombia y más · "
+           "Las fechas se leen automáticamente de las páginas: confírmalas siempre en la convocatoria oficial.")
 
-with st.spinner("🛰️ Rastreando fuentes y leyendo convocatorias… (la primera carga puede tardar 1–2 min)"):
+with st.spinner("🛰️ Escaneando la web y los portales oficiales… (la primera carga puede tardar 2–4 min)"):
     items, log, primera = cargar_radar(profundidad, tuple(fuentes), tuple(lineas_sel),
-                                       secreto("RELIEFWEB_APPNAME"), secreto("JOOBLE_API_KEY"))
+                                       secreto("RELIEFWEB_APPNAME"), secreto("JOOBLE_API_KEY"),
+                                       secreto("SERPER_API_KEY"))
 
 for o in items:
-    rc.puntuar(o, lineas_sel, HOY, boost_nuevo=not primera)
+    rc.puntuar(o, lineas_sel, HOY, boost_nuevo=not primera, paises_prioridad=paises_prio, niveles_pref=niveles_sel)
 
-extra_rx = None
-if extra.strip():
-    import re
-    extra_rx = re.compile(re.escape(rc.norm(extra.strip())))
+extra_rx = re.compile(re.escape(rc.norm(extra.strip()))) if extra.strip() else None
+ciudad_rx = re.compile(re.escape(rc.norm(ciudad.strip()))) if ciudad.strip() else None
 
 
 # ───────────────────────── filtros ─────────────────────────
+def nivel_ok(o):
+    if o.nivel in ("", rc.NIV_OTRO):
+        return incluir_sin_nivel
+    return (not niveles_sel) or any(n in o.nivel for n in niveles_sel)
+
+
 def pasa(o, es_estudio=False, es_trabajo=False):
-    if o.origen == "directorio":
-        et = "Sin fecha confirmada"
-    else:
-        et = rc.estado(o.inicio, o.cierre, HOY)[0]
-        if et not in estados_sel:
+    if o.origen == "detectada":
+        if rc.estado(o.inicio, o.cierre, HOY)[0] not in estados_sel:
             return False
     if conf_min == "Solo verificadas" and o.confianza != "Alta":
         return False
     if conf_min == "Fuente reconocida o mejor" and o.confianza == "Baja":
         return False
     if es_estudio:
-        if o.region not in regiones_est and o.region != "Global":
+        if not nivel_ok(o):
+            return False
+        if solo_paises and paises_prio and o.pais not in paises_prio:
             return False
         if solo_elegibles and "⚠️" in o.elegibilidad:
             return False
         if solo_financiadas and o.financiamiento != rc.FIN_COMPLETA:
             return False
     if es_trabajo:
-        if o.region not in regiones_trab:
+        if regiones_trab and o.region not in regiones_trab:
             return False
         if cargos_sel and o.cargo_tipo not in cargos_sel:
+            return False
+        if ciudad_rx and not ciudad_rx.search(rc.norm(o.titulo + " " + o.resumen + " " + o.texto)):
             return False
     if (lineas_sel or extra_rx) and solo_lineas:
         coincide = bool(set(o.lineas) & set(lineas_sel)) if lineas_sel else False
@@ -173,15 +186,17 @@ def fila_fechas(o):
     if o.origen == "directorio":
         st.markdown("📅 **Fechas:** ver convocatoria vigente en el sitio oficial")
         if o.meses:
-            meses = ", ".join(rc.MES_ES[m - 1] for m in o.meses)
-            st.caption(f"Ciclo habitual (referencial): {meses}")
+            st.caption("Ciclo habitual (referencial): " + ", ".join(rc.MES_ES[m - 1] for m in o.meses))
         return
     et, dc, di = rc.estado(o.inicio, o.cierre, HOY)
+    if o.tipo == "trabajo" and not o.cierre:
+        st.markdown(f"📅 **Publicada:** {rc.fmt_fecha(o.publicado) if o.publicado else 'fecha no indicada'}")
+        return
     st.markdown(f"📅 **Abre:** {rc.fmt_fecha(o.inicio) if o.inicio else 'no indicada'}"
                 + (f" _(en {di} d)_" if di is not None else ""))
     if o.cierre:
-        extra_txt = f" _({dc} d)_" if dc is not None and dc >= 0 else " _(cerrada)_"
-        st.markdown(f"⏳ **Cierra:** {rc.fmt_fecha(o.cierre)}{extra_txt}")
+        st.markdown(f"⏳ **Cierra:** {rc.fmt_fecha(o.cierre)}"
+                    + (f" _({dc} d)_" if dc is not None and dc >= 0 else " _(cerrada)_"))
     else:
         st.markdown("⏳ **Cierra:** sin confirmar")
 
@@ -197,10 +212,7 @@ def tarjeta(o):
             if meta:
                 st.markdown(f'<div class="meta">{escape(meta)}</div>', unsafe_allow_html=True)
             b = badge(TXT_CONF[o.confianza], CLS_CONF[o.confianza])
-            if o.origen == "directorio":
-                b += badge("📚 Directorio oficial", "b-info")
-            else:
-                b += badge(et, CLS_ESTADO.get(et, "b-info"))
+            b += badge("📚 Directorio oficial", "b-info") if o.origen == "directorio" else badge(et, CLS_ESTADO.get(et, "b-info"))
             if o.financiamiento != rc.FIN_ND:
                 b += badge("💰 " + o.financiamiento, "b-ok" if o.financiamiento == rc.FIN_COMPLETA else "b-warn")
             if o.elegibilidad != "No indicada" and o.tipo != "trabajo":
@@ -225,12 +237,22 @@ def tarjeta(o):
         b1, b2, _ = st.columns([1, 1, 3])
         b1.link_button("Ver convocatoria" if o.origen == "detectada" else "Ir al sitio", o.url)
         if o.url_oficial:
-            b2.link_button("Sitio oficial", o.url_oficial)
+            b2.link_button("Portal oficial", o.url_oficial)
+
+
+def mini(o):
+    with st.container(border=True):
+        st.markdown(f"**{o.titulo[:95]}**")
+        if o.origen == "directorio":
+            st.caption(f"📚 Directorio oficial · {o.institucion[:40]}")
+        else:
+            st.caption(f"{o.pais} · cierre {rc.fmt_fecha(o.cierre) if o.cierre else 'sin confirmar'} · {TXT_CONF[o.confianza]}")
+        st.link_button("Abrir", o.url)
 
 
 def lista(items_, key, nombre_csv):
     if not items_:
-        st.info("Sin resultados con los filtros actuales. Prueba ampliar estados, destino o confianza en la barra lateral.")
+        st.info("Sin resultados con los filtros actuales. Prueba ampliar estados, países o confianza en la barra lateral.")
         return
     c1, c2 = st.columns([4, 1])
     c1.caption(f"{len(items_)} resultados")
@@ -253,76 +275,95 @@ def directorio(items_, key, nombre_csv):
         return
     st.markdown("---")
     st.subheader("📚 Directorio oficial de programas e instituciones recurrentes")
-    st.caption("Portales institucionales donde se publican convocatorias cada año. No tienen fecha fija aquí: "
-               "entra al sitio y consulta la convocatoria vigente.")
+    st.caption("Portales institucionales donde se publican convocatorias cada año. Entra al sitio y consulta la "
+               "convocatoria vigente (si el escaneo encontró una con fecha, aparece arriba como detectada).")
     lista(items_, key, nombre_csv)
 
 
 # ───────────────────────── pestañas ─────────────────────────
-t_top, t_est, t_trab, t_fon, t_bus, t_alert = st.tabs(
-    ["🌟 Top semanal", "🎓 Estudios", "💼 Trabajo", "💰 Fondos agrarios", "🔗 Buscadores directos", "📩 Alertas"])
+t_top, t_est, t_trab, t_fon, t_guia, t_bus, t_alert = st.tabs(
+    ["🌟 Top semanal", "🎓 Estudios", "💼 Trabajo", "💰 Fondos agrarios", "📘 Guía de maestría",
+     "🔗 Buscadores directos", "📩 Alertas"])
 
 # ── Top
 with t_top:
     detectadas = est_det + trab_det + fon_det
-    abiertas = [o for o in detectadas if rc.estado(o.inicio, o.cierre, HOY)[0] in ("Abierta", "Cierra pronto")]
     pronto = [o for o in detectadas if rc.estado(o.inicio, o.cierre, HOY)[0] == "Cierra pronto"]
+    con_fecha = [o for o in est_det + fon_det + trab_det if o.cierre]
     nuevas = [o for o in detectadas if (not primera) and o.descubierto and
               (HOY - rc.date.fromisoformat(o.descubierto)).days <= 7]
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Oportunidades detectadas", len(detectadas))
-    m2.metric("Con postulación abierta", len(abiertas))
-    m3.metric("Cierran en ≤ 14 días", len(pronto))
-    m4.metric("Nuevas esta semana", len(nuevas) if not primera else "—")
+    m1.metric("Maestrías detectadas", len(est_det))
+    m2.metric("Empleos detectados", len(trab_det))
+    m3.metric("Con fecha de cierre leída", len(con_fecha))
+    m4.metric("Cierran en ≤ 14 días", len(pronto))
     if primera:
-        st.caption("Primera ejecución: el contador de «nuevas» empieza a funcionar desde la próxima actualización.")
+        st.caption("Primera ejecución: la marca «nueva» empieza a funcionar desde la próxima actualización.")
 
-    top = sorted(detectadas, key=lambda o: -o.puntaje)[:5]
-    st.markdown("### 🔥 Top 5 de la semana")
-    st.caption("Ranking por: relevancia agronómica, confianza de la fuente, nivel/financiación, urgencia de la "
-               "fecha de cierre, coincidencia con tus líneas y cercanía a Colombia.")
-    for o in top:
+    st.markdown(f"### 🎓 Top 5 — {', '.join(niveles_sel) or 'estudios'}")
+    for o in sorted(est_det, key=lambda o: -o.puntaje)[:5]:
         tarjeta(o)
-    cA, cB, cC = st.columns(3)
-    for col, titulo, lst in ((cA, "🎓 Mejores estudios", est_det), (cB, "💼 Mejores empleos", trab_det),
-                             (cC, "💰 Mejores fondos", fon_det)):
-        with col:
-            st.markdown(f"#### {titulo}")
-            for o in sorted(lst, key=lambda x: -x.puntaje)[:3]:
-                with st.container(border=True):
-                    st.markdown(f"**{o.titulo[:110]}**")
-                    st.caption(f"{o.pais} · cierre {rc.fmt_fecha(o.cierre) if o.cierre else 'sin confirmar'} · "
-                               f"{TXT_CONF[o.confianza]}")
-                    st.link_button("Abrir", o.url)
-    cal = rc.calendario_recurrente(items, HOY)
+    if not est_det:
+        st.info("Aún no hay convocatorias detectadas con fecha. Mira el directorio oficial en la pestaña Estudios.")
+
+    if paises_prio:
+        st.markdown("### 🌎 Tus países prioritarios")
+        todos_est = [o for o in items if o.tipo == "estudio" and pasa(o, es_estudio=True)]
+        por_pais = rc.top_por_pais(todos_est, paises_prio, 3, HOY)
+        cols = st.columns(min(len(paises_prio), 4))
+        for i, (pais, lst) in enumerate(por_pais.items()):
+            with cols[i % len(cols)]:
+                st.markdown(f"#### {pais}")
+                if not lst:
+                    st.caption("Sin resultados con los filtros actuales.")
+                for o in lst:
+                    mini(o)
+
+    st.markdown("### 💼 Top 5 — empleo " + ("en " + ", ".join(regiones_trab) if regiones_trab else ""))
+    for o in sorted(trab_det, key=lambda o: -o.puntaje)[:5]:
+        tarjeta(o)
+    if not trab_det:
+        st.info("Sin ofertas detectadas. Revisa «Estado de las fuentes» abajo y los Buscadores directos.")
+
+    st.markdown("### 💰 Mejores fondos")
+    cF = st.columns(3)
+    for i, o in enumerate(sorted(fon_det, key=lambda x: -x.puntaje)[:3]):
+        with cF[i]:
+            mini(o)
+
+    cal = rc.calendario_recurrente(items, HOY, niveles_sel)
     if cal:
         st.markdown("### 📆 Programas que suelen abrir este mes o el próximo")
         st.caption("Referencial, según ciclos de años anteriores. Confirma en el sitio oficial.")
         for o in cal:
             tarjeta(o)
-    st.download_button("📥 Descargar Top + todo lo detectado (CSV)",
+    st.download_button("📥 Descargar todo lo detectado (CSV)",
                        rc.a_csv(sorted(detectadas, key=lambda o: -o.puntaje), HOY), "radar_agro_completo.csv",
                        "text/csv", key="csv_top")
 
-# ── Estudios (separados por nivel)
+# ── Estudios
 with t_est:
-    NIVELES = [("Maestría", rc.NIV_MAESTRIA), ("Doctorado (PhD)", rc.NIV_DOCT), ("Postdoctorado", rc.NIV_POSTDOC),
-               ("Cursos", rc.NIV_CURSO), ("Posgrado / Esp.", rc.NIV_POSGRADO), ("Pasantías", rc.NIV_PASANTIA),
-               ("Otros", rc.NIV_OTRO)]
-    nombres = ["Todos"] + [f"{n} ({sum(1 for o in est_det if k in o.nivel)})" for n, k in NIVELES]
+    st.caption("Enfocado en: " + (", ".join(niveles_sel) or "todos los niveles") +
+               ". Cambia el nivel y los países en la barra lateral.")
+    nombres = ["Todos"] + [f"{n} ({sum(1 for o in est_det if n in o.nivel)})" for n in niveles_sel]
+    if incluir_sin_nivel:
+        nombres.append(f"Nivel no identificado ({sum(1 for o in est_det if o.nivel in ('', rc.NIV_OTRO))})")
     sub = st.tabs(nombres)
     with sub[0]:
         lista(est_det, "est_todos", "estudios_todos")
         directorio(est_dir, "est_dir_todos", "directorio_estudios")
-    for tab, (n, k) in zip(sub[1:], NIVELES):
+    for tab, n in zip(sub[1:1 + len(niveles_sel)], niveles_sel):
         with tab:
-            lista([o for o in est_det if k in o.nivel], f"est_{k}", f"estudios_{n.lower().replace(' ', '_')}")
-            directorio([o for o in est_dir if k in o.nivel], f"estdir_{k}", f"directorio_{k.lower()[:6]}")
+            lista([o for o in est_det if n in o.nivel], f"est_{n}", f"estudios_{n.lower().split()[0]}")
+            directorio([o for o in est_dir if n in o.nivel], f"estdir_{n}", f"directorio_{n.lower().split()[0]}")
+    if incluir_sin_nivel:
+        with sub[-1]:
+            lista([o for o in est_det if o.nivel in ("", rc.NIV_OTRO)], "est_sin", "estudios_sin_nivel")
 
 # ── Trabajo
 with t_trab:
-    st.caption("Prioriza Colombia y países de la región donde un ingeniero agrónomo colombiano puede trabajar con "
-               "menos barreras. Ajusta el destino en la barra lateral.")
+    st.caption("Enfocado en: " + (", ".join(regiones_trab) or "todas las regiones") +
+               ". Las ofertas suelen tener fecha de publicación, no de cierre.")
     lista(trab_det, "trab", "empleos_agronomia")
     directorio(trab_dir, "trab_dir", "empleadores_clave")
 
@@ -331,6 +372,39 @@ with t_fon:
     st.caption("Fondos, incentivos y convocatorias de proyectos agropecuarios (Colombia, región y organismos internacionales).")
     lista(fon_det, "fon", "fondos_agrarios")
     directorio(fon_dir, "fon_dir", "directorio_fondos")
+
+# ── Guía
+with t_guia:
+    st.markdown("""
+### Qué necesitas para hacer una maestría después del pregrado
+Los requisitos exactos cambian por programa y por país: **revisa siempre el edital o la convocatoria**.
+Lo que casi siempre piden:
+
+1. **Título de pregrado** (Ingeniero Agrónomo) ya otorgado, o certificado de que estás próximo a graduarte.
+2. **Documentos académicos**: diploma, certificado de notas y promedio. Para estudiar fuera suelen exigir
+   **apostilla** (Colombia es parte del Convenio de La Haya) y a veces traducción oficial.
+3. **Hoja de vida y carta de motivación.**
+4. **Dos o tres cartas de recomendación** de profesores o directores de tesis.
+5. **Anteproyecto o propuesta de investigación** (clave en Brasil, Japón y China, y en toda maestría de investigación).
+6. **Idioma**: inglés para programas en inglés (muchos piden IELTS ~6.0–6.5 o TOEFL iBT ~80, según el programa);
+   portugués en Brasil (varias maestrías piden prueba o entrevista; algunas aceptan inglés); inglés o chino/japonés
+   según el idioma de enseñanza en China y Japón.
+7. **Contactar antes a un profesor/orientador**: en Brasil (orientador), Japón (supervisor) y China (supervisor)
+   es muy común, y a veces obligatorio, para que te acepten o te patrocinen.
+8. **Pruebas internas**: examen escrito, análisis de currículo y/o entrevista (muy frecuente en Brasil y Colombia).
+
+**Ayudan, pero no siempre son obligatorios:** buen promedio, tesis de pregrado, semilleros de investigación,
+pósters o artículos, experiencia en laboratorio o campo.
+
+**Tiempos:** empieza **8–12 meses antes**. Apostillar documentos, certificar el idioma y conseguir cartas toma semanas,
+y muchas becas (MEXT, CSC, GKS, Chevening, DAAD) cierran entre 6 y 12 meses antes de que inicie el programa.
+
+**Maestría de investigación vs. profundización:** si piensas hacer doctorado después, elige una *maestría de investigación*
+(con tesis); suele abrir más puertas a becas y programas doctorales.
+
+**Financiación:** ICETEX (Colombia), MEXT (Japón), CSC (China), GKS (Corea), CAPES/CNPq (Brasil), Chevening, DAAD,
+Fulbright, Erasmus Mundus. Mira cuáles incluyen a Colombia en el directorio de la pestaña Estudios.
+""")
 
 # ── Buscadores directos
 with t_bus:
@@ -354,19 +428,24 @@ with t_alert:
     st.markdown("### 📩 Alerta semanal automática")
     st.markdown(
         "Streamlit no corre tareas programadas, así que la alerta vive en **GitHub Actions** (gratis). "
-        "Cada lunes a las 7:00 a. m. (Colombia) ejecuta `alerta_semanal.py`, arma el Top 5 y te lo envía por correo.\n\n"
+        "Cada lunes a las 7:00 a. m. (Colombia) ejecuta `alerta_semanal.py` y te envía por correo: "
+        "**maestrías**, **mejores opciones en Brasil, Japón y China** y **empleo en Colombia**.\n\n"
         "1. Sube esta carpeta a un repositorio de GitHub.\n"
-        "2. En *Settings → Secrets and variables → Actions* crea: `SMTP_USER` (tu Gmail), `SMTP_PASSWORD` "
-        "(contraseña de aplicación de Google), `ALERT_TO` (correo destino), y opcionalmente "
-        "`RELIEFWEB_APPNAME` y `JOOBLE_API_KEY`.\n"
-        "3. En *Variables* crea `LINEAS` con tus líneas separadas por `;` (p. ej. `Fitomejoramiento;Fitopatología`).\n"
+        "2. En *Settings → Secrets and variables → Actions* crea los **Secrets**: `SMTP_USER` (tu Gmail), "
+        "`SMTP_PASSWORD` (contraseña de aplicación de Google), `ALERT_TO` (correo destino). Opcionales y gratuitos: "
+        "`SERPER_API_KEY` (serper.dev, búsqueda web tipo Google), `RELIEFWEB_APPNAME`, `JOOBLE_API_KEY`.\n"
+        "3. En *Variables* puedes definir: `LINEAS` (p. ej. `Fitomejoramiento;Fitopatología`), `NIVELES` "
+        "(por defecto `Maestría`), `PAISES_PRIORIDAD` (por defecto `Brasil;Japón;China;Colombia`) y "
+        "`REGIONES_TRABAJO` (por defecto `Colombia`).\n"
         "4. Ejecuta el workflow una vez con *Run workflow* para probarlo.")
     st.markdown("##### Vista previa del correo con los datos actuales")
-    top5 = sorted(est_det + trab_det + fon_det, key=lambda o: -o.puntaje)[:5]
-    html = rc.html_correo(top5, {"🎓 Estudios": sorted(est_det, key=lambda o: -o.puntaje)[:3],
-                                 "💼 Trabajo": sorted(trab_det, key=lambda o: -o.puntaje)[:3],
-                                 "💰 Fondos": sorted(fon_det, key=lambda o: -o.puntaje)[:2]},
-                          rc.calendario_recurrente(items, HOY), HOY)
+    top5 = sorted(est_det + trab_det, key=lambda o: -o.puntaje)[:5]
+    secs = {"🎓 Maestrías": sorted(est_det, key=lambda o: -o.puntaje)[:4]}
+    for pais, lst in rc.top_por_pais(est_det + est_dir, paises_prio[:3], 2, HOY).items():
+        secs[f"🌎 {pais}"] = lst
+    secs["💼 Empleo en " + (", ".join(regiones_trab) or "Colombia")] = sorted(trab_det, key=lambda o: -o.puntaje)[:4]
+    secs["💰 Fondos"] = sorted(fon_det, key=lambda o: -o.puntaje)[:2]
+    html = rc.html_correo(top5, secs, rc.calendario_recurrente(items, HOY, niveles_sel), HOY)
     st.components.v1.html(html, height=520, scrolling=True)
     u, p = secreto("SMTP_USER"), secreto("SMTP_PASSWORD")
     dest = st.text_input("Enviar prueba a:", value=secreto("ALERT_TO") or "")
@@ -381,6 +460,6 @@ with t_alert:
 
 # ── Estado de fuentes
 with st.expander("🩺 Estado de las fuentes"):
-    tabla(__import__("pandas").DataFrame(log))
+    tabla(pd.DataFrame(log))
     st.caption("Si una fuente aparece con ⚠️, el resto del radar sigue funcionando. Los portales comerciales pueden "
-               "bloquear consultas automáticas; usa la pestaña «Buscadores directos» como respaldo.")
+               "bloquear consultas automáticas; usa «Buscadores directos» como respaldo.")
